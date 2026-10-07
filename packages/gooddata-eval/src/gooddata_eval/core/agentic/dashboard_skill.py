@@ -294,17 +294,36 @@ def _filter_entries(dashboard: dict) -> list[tuple[str, dict]]:
     local identifier, so the role has to be read from each entry's ``type`` instead. The label
     is only there to say *where* a failure was found.
     """
+    return [(label, value) for label, value, _group in _grouped_filter_entries(dashboard)]
+
+
+def _grouped_filter_entries(dashboard: dict) -> list[tuple[str, dict, str | None]]:
+    """``(label, filter, group title)`` for every filter, with a group's members read in its place.
+
+    A ``filter_group`` holds its members in a nested map, so reading only the outer map would
+    miss every filter the agent chose to group and report it missing. The group entry itself is
+    not a filter and is not returned.
+    """
     tabs = dashboard.get("tabs")
-    if tabs:
-        return [
-            (f"tab {tab.get('id')!r}", value)
-            for tab in tabs
-            for value in (tab.get("filters") or {}).values()
-            if isinstance(value, dict)
-        ]
-    return [
-        (f"filter {key!r}", value) for key, value in (dashboard.get("filters") or {}).items() if isinstance(value, dict)
-    ]
+    maps = (
+        [(f"tab {tab.get('id')!r}", tab.get("filters") or {}) for tab in tabs]
+        if tabs
+        else [("", dashboard.get("filters") or {})]
+    )
+    entries: list[tuple[str, dict, str | None]] = []
+    for where, filters in maps:
+        for key, value in filters.items():
+            if not isinstance(value, dict):
+                continue
+            label = where or f"filter {key!r}"
+            if value.get("type") != "filter_group":
+                entries.append((label, value, None))
+                continue
+            group = str(value.get("title") or "")
+            entries.extend(
+                (label, member, group) for member in (value.get("filters") or {}).values() if isinstance(member, dict)
+            )
+    return entries
 
 
 def _filters_of_type(dashboard: dict, filter_type: str) -> list[tuple[str, dict]]:
@@ -385,29 +404,94 @@ def _describe_selection(selection: tuple[str, list] | None) -> str:
 
 
 def _check_filters(dashboard: dict, expected: list[dict]) -> list[str]:
-    """Every expected attribute filter must be on the dashboard, with the stated selection.
+    """Every expected filter must be on the dashboard, with the stated selection or condition.
+
+    An entry is an attribute filter unless it names ``type`` as ``text_filter`` or
+    ``metric_value_filter``. ``group`` requires the filter to sit in the ``filter_group`` of that
+    title; without it, a grouped filter counts the same as one on its own.
 
     This exists because an edit can silently drop or widen the filters the user already had:
     the change asked for was a rename, and the filters coming back untouched is part of what
     "untouched" means. Filters the dashboard carries beyond the expected ones are left alone,
     the same way extra widgets are.
     """
-    actual: dict[str | None, list[dict]] = {}
-    for _label, attribute_filter in _filters_of_type(dashboard, "attribute_filter"):
-        actual.setdefault(attribute_filter.get("using"), []).append(attribute_filter)
-
+    entries = _grouped_filter_entries(dashboard)
     failures: list[str] = []
     for exp in expected:
+        filter_type = _expected_filter_type(exp)
         using = exp.get("using")
-        matches = actual.get(using) or []
-        if not matches:
-            failures.append(f"the dashboard carries no attribute filter on {using!r}")
+        candidates = [
+            (f, group)
+            for _label, f, group in entries
+            if f.get("type") == filter_type and _same_object_ref(f.get("using"), using)
+        ]
+        noun = filter_type.replace("_", " ")
+        if not candidates:
+            failures.append(f"the dashboard carries no {noun} on {using!r}")
             continue
+        if "group" in exp:
+            grouped = [
+                (f, group) for f, group in candidates if group is not None and _norm(group) == _norm(exp["group"])
+            ]
+            if not grouped:
+                found = ", ".join(repr(group) for _f, group in candidates)
+                failures.append(f"{noun} on {using!r} sits in group {found}, expected {exp['group']!r}")
+                continue
+            candidates = grouped
+        matches = [f for f, _group in candidates]
+        if filter_type != "attribute_filter":
+            if not any(not _filter_value_mismatch(f, exp) for f in matches):
+                failures.append(f"{noun} on {using!r}: {'; '.join(_filter_value_mismatch(matches[0], exp))}")
+            continue
+        if "display_as" in exp:
+            # GDAI-2488: a value change on a filter shown through a secondary label moves `using`
+            # to the primary label and keeps the secondary one as `display_as`. Losing it shows
+            # the user ids where they had names, while `using` and the selection stay right.
+            shown = [f for f in matches if _same_object_ref(f.get("display_as"), exp["display_as"])]
+            if not shown:
+                found = ", ".join(repr(f.get("display_as")) for f in matches)
+                failures.append(f"filter on {using!r} is displayed as {found}, expected {exp['display_as']!r}")
+                continue
+            matches = shown
         wanted = _expected_selection(exp)
         if not any(_selection_of(f) == wanted for f in matches):
             found = ", ".join(_describe_selection(_selection_of(f)) for f in matches)
             failures.append(f"filter on {using!r} selects {found}, expected {_describe_selection(wanted)}")
     return failures
+
+
+# The kinds a `filters` entry can name, and for each the keys compared beyond `using`. An entry
+# without `type` is an attribute filter, which is every entry written before the others existed.
+_FILTER_VALUE_KEYS: dict[str, tuple[str, ...]] = {
+    "attribute_filter": (),
+    "text_filter": ("condition", "value", "values", "case_sensitive"),
+    "metric_value_filter": ("conditions", "dimensionality", "null_values_as_zero"),
+}
+
+
+def _expected_filter_type(expected_filter: dict) -> str:
+    return str(expected_filter.get("type") or "attribute_filter")
+
+
+def _filter_value_mismatch(actual: dict, expected: dict) -> list[str]:
+    """Why a text or metric value filter differs from the expectation, on the keys it states.
+
+    ``values`` compares as a set: the order of whole values for ``is``/``isNot`` carries no
+    meaning. A key the expectation leaves out is not compared, so a case states what it guards.
+    """
+    mismatches: list[str] = []
+    for key in _FILTER_VALUE_KEYS[_expected_filter_type(expected)]:
+        if key not in expected:
+            continue
+        want, got = expected[key], actual.get(key)
+        same = (
+            sorted(map(str, want)) == sorted(map(str, got))
+            if key == "values" and isinstance(got, list)
+            else got == want
+        )
+        if not same:
+            mismatches.append(f"{key} expected {want!r}, got {got!r}")
+    return mismatches
 
 
 def _expected_selection(expected_filter: dict) -> tuple[str, list] | None:
@@ -426,6 +510,224 @@ def _expected_selection(expected_filter: dict) -> tuple[str, list] | None:
         f"filter expectation for {expected_filter.get('using')!r} needs 'selection': 'all', "
         f"'include' or 'exclude', got {expected_filter!r}"
     )
+
+
+def _matching_widgets(widgets: list[dict], new_ids: set[str], expected: dict) -> list[dict]:
+    """The widgets an expected chart entry names: by ``id``, or by title among the authored charts.
+
+    Every widget the id appears under counts, whatever its title -- the checks that use this
+    look at what a chart is bound to, and a rename is ``charts_matched``'s business.
+    """
+    exp_id = expected.get("id")
+    if exp_id is not None:
+        return [w for w in widgets if w.get("visualization") == exp_id]
+    title = _norm(str(expected.get("title") or ""))
+    return [w for w in widgets if w.get("visualization") in new_ids and _norm(str(w.get("title") or "")) == title]
+
+
+def _has_date_bindings(expected_output: dict) -> bool:
+    """Whether any expected chart states the date dataset its widget must follow.
+
+    Per chart, not per case: a chart that reaches no date dataset correctly ignores the date
+    filter, so "every widget has a date" is not an expectation that holds in general.
+    """
+    return any(isinstance(v, dict) and "date_dataset" in v for v in expected_output.get("visualizations") or [])
+
+
+def _check_date_bindings(widgets: list[dict], new_ids: set[str], expected: list[dict]) -> list[str]:
+    """Every widget of a chart that states a ``date_dataset`` must be bound to exactly that one.
+
+    ``null`` means the widget must carry no date at all: the chart reaches no date dataset, and
+    a binding there would be one the dashboard cannot honour. The widget key is AAC's ``date``,
+    the declarative ``dateDataSet`` (GDAI-2391, GDAI-2462).
+    """
+    failures: list[str] = []
+    for exp in expected:
+        if not isinstance(exp, dict) or "date_dataset" not in exp:
+            continue
+        wanted = exp["date_dataset"]
+        label = exp.get("title") if exp.get("id") is None else exp.get("id")
+        candidates = _matching_widgets(widgets, new_ids, exp)
+        if not candidates:
+            # Not left to charts_matched alone: a check that could not look must not read as passed.
+            failures.append(f"cannot check the date binding of chart {label!r}: it is not on the dashboard")
+            continue
+        # Every placement: the expectation names the chart, so one right placement must not hide a wrong one.
+        if not all(w.get("date") == wanted for w in candidates):
+            found = ", ".join(repr(w.get("date")) for w in candidates)
+            failures.append(f"chart {label!r} follows date {found}, expected {wanted!r}")
+    return failures
+
+
+def _tabs_of(dashboard: dict) -> list[dict]:
+    """The dashboard's tabs, reading a document with root sections as its single tab."""
+    tabs = dashboard.get("tabs")
+    if tabs:
+        return list(tabs)
+    return [{"sections": dashboard.get("sections") or [], "filters": dashboard.get("filters") or {}}]
+
+
+def _check_tabs(dashboard: dict, new_ids: set[str], expected: list[dict]) -> list[str]:
+    """The dashboard must have exactly the expected tabs, in order (GDAI-2426).
+
+    A tab entry may name a ``title``, compared like every other title, and ``visualizations``
+    that must sit on that tab -- each an id, or ``{"title": ...}`` for an authored chart. An
+    empty entry asserts only that the tab exists, which is how a case says "one tab, any name".
+    """
+    tabs = _tabs_of(dashboard)
+    if len(tabs) != len(expected):
+        titles = ", ".join(repr(t.get("title")) for t in tabs)
+        return [f"the dashboard has {len(tabs)} tab(s) ({titles}), expected {len(expected)}"]
+    failures: list[str] = []
+    for index, (tab, exp) in enumerate(zip(tabs, expected)):
+        if "title" in exp and _norm(str(tab.get("title") or "")) != _norm(str(exp["title"] or "")):
+            failures.append(f"tab {index} is titled {tab.get('title')!r}, expected {exp['title']!r}")
+        tab_widgets = [w for section in tab.get("sections") or [] for w in section.get("widgets") or []]
+        for chart in exp.get("visualizations") or []:
+            entry = {"id": chart} if isinstance(chart, str) else {"id": None, **chart}
+            if not _matching_widgets(tab_widgets, new_ids, entry):
+                failures.append(f"tab {index} ({tab.get('title')!r}) does not hold chart {chart!r}")
+    return failures
+
+
+# The keys a date filter is compared on. Absent on both sides is a match -- an all-time filter
+# spells itself by leaving `from` and `to` out, and a dashboard-wide one by leaving `date` out.
+_DATE_FILTER_KEYS = ("granularity", "from", "to", "date")
+
+
+def _filter_mismatch(label: str, actual: dict, expected: dict) -> list[str]:
+    """Why ``actual`` is not the ``expected`` filter, or nothing.
+
+    A date filter is compared on its range and dataset, an attribute filter on its labels and
+    selection, both with absence significant. Any other kind is compared on the keys the
+    expectation names.
+    """
+    if actual.get("type") != expected.get("type"):
+        return [f"{label} is a {actual.get('type')!r}, expected a {expected.get('type')!r}"]
+    if expected.get("type") == "date_filter":
+        keys: tuple[str, ...] = _DATE_FILTER_KEYS
+    elif expected.get("type") == "attribute_filter":
+        if _selection_of(actual) != _selection_of(expected):
+            return [
+                f"{label} selects {_describe_selection(_selection_of(actual))}, "
+                f"expected {_describe_selection(_selection_of(expected))}"
+            ]
+        keys = ("using", "display_as")
+    else:
+        keys = tuple(k for k in expected if k != "type")
+    return [
+        f"{label}: {key} expected {expected.get(key)!r}, got {actual.get(key)!r}"
+        for key in keys
+        if not (
+            _same_object_ref(actual.get(key), expected.get(key))
+            if key in ("using", "display_as")
+            else actual.get(key) == expected.get(key)
+        )
+    ]
+
+
+def _same_object_ref(actual: object, expected: object) -> bool:
+    """Whether two AAC refs name the same object, reading ``attribute/<id>`` as ``label/<id>``.
+
+    The draft and patch tools accept either prefix on a filter's ``using``, and the model picks
+    one per run. An attribute and its primary label share the id, so the two spell one filter;
+    matching the prefix verbatim failed a correct run on the model's wording.
+    """
+    if actual == expected:
+        return True
+    if not (isinstance(actual, str) and isinstance(expected, str)):
+        return False
+    return _ref_without_attribute_prefix(actual) == _ref_without_attribute_prefix(expected)
+
+
+def _ref_without_attribute_prefix(ref: str) -> str:
+    return "label/" + ref.removeprefix("attribute/") if ref.startswith("attribute/") else ref
+
+
+def _check_tab_filters(dashboard: dict, expected: dict[str, dict]) -> list[str]:
+    """Each named tab must carry exactly the expected filters, by the filter's own id.
+
+    Exact on purpose: GDAI-2540 is a filter that turns up on a tab it never belonged to, which a
+    check of only the expected entries would pass. Keyed by the saved dashboard's local filter
+    id rather than by label, so two filters on the same label stay distinguishable.
+    """
+    tabs = {tab.get("id"): tab for tab in dashboard.get("tabs") or []}
+    failures: list[str] = []
+    for tab_id, expected_filters in expected.items():
+        tab = tabs.get(tab_id)
+        if tab is None:
+            failures.append(f"the dashboard has no tab {tab_id!r}")
+            continue
+        actual = {k: v for k, v in (tab.get("filters") or {}).items() if isinstance(v, dict)}
+        failures.extend(
+            f"tab {tab_id!r} carries filter {filter_id!r}, which it should not"
+            for filter_id in sorted(actual.keys() - expected_filters.keys())
+        )
+        failures.extend(
+            f"tab {tab_id!r} lost filter {filter_id!r}" for filter_id in sorted(expected_filters.keys() - actual.keys())
+        )
+        for filter_id in sorted(expected_filters.keys() & actual.keys()):
+            failures.extend(
+                _filter_mismatch(f"tab {tab_id!r} filter {filter_id!r}", actual[filter_id], expected_filters[filter_id])
+            )
+    return failures
+
+
+def _filters_by_id(dashboard: dict) -> dict[str, list[tuple[str, dict]]]:
+    """Every filter by its own id, with where it was found; one id can recur across tabs."""
+    found: dict[str, list[tuple[str, dict]]] = {}
+    for tab in dashboard.get("tabs") or [{"filters": dashboard.get("filters") or {}}]:
+        where = f"tab {tab['id']!r} " if "id" in tab else ""
+        for filter_id, value in (tab.get("filters") or {}).items():
+            if isinstance(value, dict):
+                found.setdefault(filter_id, []).append((f"{where}filter {filter_id!r}", value))
+    return found
+
+
+def _check_date_filters(dashboard: dict, expected: dict[str, dict | None]) -> list[str]:
+    """Every named date filter must still be there, on the expected range (GDAI-2491).
+
+    Named by id because nothing in the document says which date filter is the main one; a
+    dataset-scoped filter carries ``date``, but a drafted main filter can as well. Filters the
+    expectation does not name are left alone.
+    """
+    found = _filters_by_id(dashboard)
+    failures: list[str] = []
+    for filter_id, wanted in expected.items():
+        entries = found.get(filter_id)
+        if not entries:
+            failures.append(f"the dashboard lost date filter {filter_id!r}")
+            continue
+        for label, date_filter in entries:
+            if date_filter.get("type") != "date_filter":
+                failures.append(f"{label} is a {date_filter.get('type')!r}, expected a date filter")
+                continue
+            failures.extend(_date_filter_mismatch(label, date_filter, wanted))
+    return failures
+
+
+def _check_preserved_widgets(widgets: list[dict], expected: list[dict]) -> list[str]:
+    """A widget the change did not target must keep every key the expectation lists (GDAI-2541).
+
+    Compared on the keys listed and nothing else, so a case states what it guards -- AAC writes
+    a hidden title as ``title: false`` and drills as ``interactions``.
+    """
+    failures: list[str] = []
+    for exp in expected:
+        viz_id = exp.get("visualization")
+        keys = [k for k in exp if k != "visualization"]
+        candidates = [w for w in widgets if w.get("visualization") == viz_id]
+        if not candidates:
+            failures.append(f"the widget showing {viz_id!r} is gone")
+            continue
+        # Every placement keeps the keys: one intact copy must not hide one that lost its drill.
+        mismatched = [w for w in candidates if not all(w.get(k) == exp[k] for k in keys)]
+        if not mismatched:
+            continue
+        widget = mismatched[0]
+        changed = ", ".join(f"{k} {widget.get(k)!r} (expected {exp[k]!r})" for k in keys if widget.get(k) != exp[k])
+        failures.append(f"the widget showing {viz_id!r} changed: {changed}")
+    return failures
 
 
 def _date_range_text(date_range: dict | None) -> str:
@@ -463,9 +765,14 @@ def build_simulated_reply(expected_output: dict) -> str:
     if existing:
         segments.append(", ".join(existing))
     segments.extend(f'a new chart titled "{title}"' for title in authored)
+    # Only titled tabs are said: an untitled entry asserts a tab count, and asking for "one tab"
+    # out loud would be the reply leading the agent rather than the question.
+    tab_titles = [str(t["title"]) for t in expected_output.get("tabs") or [] if t.get("title")]
+    tabs = f"Put them on these tabs: {', '.join(tab_titles)}. " if tab_titles else ""
 
     return (
         f"Please use these charts: {', and '.join(segments)}. "
+        f"{tabs}"
         f"Date range: {_date_range_text(expected_output.get('date_range'))}. "
         f"Anything else is up to you. Please create the dashboard now."
     )
@@ -544,7 +851,21 @@ def _validate_expectation(expected_output: dict) -> None:
             raise ValueError(f"a filter expectation must be an object, got {entry!r}")
         if not entry.get("using"):
             raise ValueError(f"a filter expectation needs the label it filters on, got {entry!r}")
-        _expected_selection(entry)
+        if "display_as" in entry and not (isinstance(entry["display_as"], str) and entry["display_as"]):
+            raise ValueError(f"a filter's display_as must name a label, got {entry!r}")
+        if "group" in entry and not (isinstance(entry["group"], str) and entry["group"]):
+            raise ValueError(f"a filter's group must name the group's title, got {entry!r}")
+        filter_type = _expected_filter_type(entry)
+        if filter_type not in _FILTER_VALUE_KEYS:
+            raise ValueError(f"a filter expectation's type must be one of {sorted(_FILTER_VALUE_KEYS)}, got {entry!r}")
+        if filter_type == "attribute_filter":
+            _expected_selection(entry)
+        elif filter_type == "text_filter":
+            if not entry.get("condition") or ("value" in entry) == ("values" in entry):
+                raise ValueError(f"a text filter expectation needs a condition and one of value/values, got {entry!r}")
+        elif not (isinstance(entry.get("conditions"), list) and entry["conditions"]):
+            raise ValueError(f"a metric value filter expectation needs its conditions, got {entry!r}")
+    _validate_layout_expectations(expected_output)
     saved_id = expected_output.get("saved_dashboard_id")
     if _is_edit(expected_output):
         if not isinstance(saved_id, str) or not saved_id:
@@ -552,6 +873,82 @@ def _validate_expectation(expected_output: dict) -> None:
     elif saved_id is not None:
         raise ValueError(f"a creation expectation must not name a saved_dashboard_id, got {saved_id!r}")
     _min_new_visualizations(expected_output)
+
+
+def _validate_layout_expectations(expected_output: dict) -> None:
+    """Shape checks for the opt-in keys on charts, tabs, per-tab filters and preserved widgets.
+
+    Raises:
+        ValueError: one of them is unusable. Loud for the same reason as the rest of the
+            fixture checks: a typo would otherwise assert nothing and read green.
+    """
+    for chart in expected_output.get("visualizations") or []:
+        if isinstance(chart, dict) and "date_dataset" in chart:
+            wanted = chart["date_dataset"]
+            if wanted is not None and not (isinstance(wanted, str) and wanted):
+                raise ValueError(f"date_dataset must name a date dataset or be null, got {chart!r}")
+
+    if "tabs" in expected_output:
+        tabs = expected_output["tabs"]
+        if not isinstance(tabs, list) or not tabs or not all(isinstance(t, dict) for t in tabs):
+            raise ValueError(f"tabs must be a non-empty list of tab objects, got {tabs!r}")
+        for tab in tabs:
+            charts = tab.get("visualizations") or []
+            if not isinstance(charts, list) or not all(
+                (isinstance(c, str) and c) or (isinstance(c, dict) and c.get("title")) for c in charts
+            ):
+                raise ValueError(f"a tab's visualizations must be chart ids or {{'title': ...}}, got {tab!r}")
+
+    if "tab_filters" in expected_output:
+        tab_filters = expected_output["tab_filters"]
+        if not isinstance(tab_filters, dict) or not tab_filters:
+            raise ValueError(f"tab_filters must map tab ids to their filters, got {tab_filters!r}")
+        for tab_id, filters in tab_filters.items():
+            if not isinstance(filters, dict) or not all(
+                isinstance(f, dict) and f.get("type") for f in filters.values()
+            ):
+                raise ValueError(f"tab_filters[{tab_id!r}] must map filter ids to typed filters, got {filters!r}")
+            for filter_id, entry in filters.items():
+                if entry["type"] == "attribute_filter":
+                    _validate_tab_attribute_filter(f"tab_filters[{tab_id!r}][{filter_id!r}]", entry)
+
+    if "date_filters" in expected_output:
+        date_filters = expected_output["date_filters"]
+        if not isinstance(date_filters, dict) or not date_filters:
+            raise ValueError(f"date_filters must map filter ids to a range or null, got {date_filters!r}")
+        for filter_id, date_range in date_filters.items():
+            if date_range is not None and not isinstance(date_range, dict):
+                raise ValueError(f"date_filters[{filter_id!r}] must be an object or null, got {date_range!r}")
+
+    if "preserved_widgets" in expected_output:
+        preserved = expected_output["preserved_widgets"]
+        if not isinstance(preserved, list) or not preserved:
+            raise ValueError(f"preserved_widgets must be a non-empty list, got {preserved!r}")
+        for widget in preserved:
+            if not isinstance(widget, dict) or not widget.get("visualization") or len(widget) < 2:
+                raise ValueError(f"a preserved widget needs its visualization and a key to guard, got {widget!r}")
+
+
+def _validate_tab_attribute_filter(where: str, entry: dict) -> None:
+    """An attribute filter in ``tab_filters`` uses the AAC shape: the selection sits under ``state``.
+
+    The ``filters`` shorthand (``include``/``exclude``/``selection`` on the entry) does not apply
+    here. Read as AAC, it would compare as "all" and pass a case that checks nothing.
+
+    Raises:
+        ValueError: the entry is not in the AAC shape.
+    """
+    shorthand = sorted({"include", "exclude", "selection"} & entry.keys())
+    if shorthand:
+        raise ValueError(f"{where} puts {shorthand} on the filter; tab_filters takes the AAC `state` object")
+    state = entry.get("state")
+    if state is None:
+        return
+    if not isinstance(state, dict):
+        raise ValueError(f"{where} state must be an object, got {state!r}")
+    for kind in ("include", "exclude"):
+        if kind in state and not isinstance(state[kind], list):
+            raise ValueError(f"{where} state.{kind} must be a list, got {state[kind]!r}")
 
 
 @dataclass(frozen=True)
@@ -567,6 +964,24 @@ class _Applies:
     patch: bool
     date: bool
     filters: bool
+    date_bindings: bool = False
+    tabs: bool = False
+    tab_filters: bool = False
+    date_filters: bool = False
+    preserved_widgets: bool = False
+
+    @classmethod
+    def of(cls, expected_output: dict) -> _Applies:
+        return cls(
+            patch=_is_edit(expected_output),
+            date=_has_date_range(expected_output),
+            filters=_has_filters(expected_output),
+            date_bindings=_has_date_bindings(expected_output),
+            tabs="tabs" in expected_output,
+            tab_filters="tab_filters" in expected_output,
+            date_filters="date_filters" in expected_output,
+            preserved_widgets="preserved_widgets" in expected_output,
+        )
 
 
 @dataclass
@@ -598,6 +1013,14 @@ class DashboardEvaluation:
     patch_applies: bool = True
     references_carried: bool = True
     titles_matched: bool = True
+    # False by default, unlike the older checks above: every early return then scores them as
+    # failed without having to name them, and only the run that reached a document sets them.
+    # They are published only where the case applies them, so a default never shows otherwise.
+    date_bindings_correct: bool = False
+    tabs_correct: bool = False
+    tab_filters_correct: bool = False
+    date_filters_correct: bool = False
+    widgets_preserved: bool = False
     failures: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -626,6 +1049,18 @@ class DashboardEvaluation:
             # Prefixed: alert_skill already publishes a `filters_correct` score, and the combo
             # report resolves a trace's skill by which score names it carries.
             checks["dashboard_filters_correct"] = self.filters_correct
+        # All prefixed, for the same reason as the filters check: the combo report tells skills
+        # apart by the score names a trace carries.
+        if self.applies.date_bindings:
+            checks["dashboard_date_bindings_correct"] = self.date_bindings_correct
+        if self.applies.tabs:
+            checks["dashboard_tabs_correct"] = self.tabs_correct
+        if self.applies.tab_filters:
+            checks["dashboard_tab_filters_correct"] = self.tab_filters_correct
+        if self.applies.date_filters:
+            checks["dashboard_date_filters_correct"] = self.date_filters_correct
+        if self.applies.preserved_widgets:
+            checks["dashboard_widgets_preserved"] = self.widgets_preserved
         return checks
 
     @property
@@ -693,7 +1128,7 @@ def evaluate_dashboard_response(
     without an agent.
     """
     is_edit = _is_edit(expected_output)
-    applies = _Applies(patch=is_edit, date=_has_date_range(expected_output), filters=_has_filters(expected_output))
+    applies = _Applies.of(expected_output)
     tool = _producing_tool(expected_output)
 
     if tool_result is None:
@@ -817,6 +1252,19 @@ def evaluate_dashboard_response(
     filter_failures = (
         _check_filters(document, expected_output.get("filters") or []) if _has_filters(expected_output) else []
     )
+    binding_failures = (
+        _check_date_bindings(widgets, new_ids, expected_output.get("visualizations") or [])
+        if applies.date_bindings
+        else []
+    )
+    tab_failures = _check_tabs(document, new_ids, expected_output["tabs"]) if applies.tabs else []
+    tab_filter_failures = _check_tab_filters(document, expected_output["tab_filters"]) if applies.tab_filters else []
+    date_filter_failures = (
+        _check_date_filters(document, expected_output["date_filters"]) if applies.date_filters else []
+    )
+    preserved_failures = (
+        _check_preserved_widgets(widgets, expected_output["preserved_widgets"]) if applies.preserved_widgets else []
+    )
 
     return DashboardEvaluation(
         drafted=True,
@@ -831,7 +1279,23 @@ def evaluate_dashboard_response(
         patch_applies=True,
         references_carried=not reference_notes,
         titles_matched=not title_mismatches,
-        failures=[*chart_failures, *saved_failures, *date_failures, *filter_failures, *new_failures],
+        date_bindings_correct=not binding_failures,
+        tabs_correct=not tab_failures,
+        tab_filters_correct=not tab_filter_failures,
+        date_filters_correct=not date_filter_failures,
+        widgets_preserved=not preserved_failures,
+        failures=[
+            *chart_failures,
+            *saved_failures,
+            *date_failures,
+            *filter_failures,
+            *binding_failures,
+            *tab_failures,
+            *tab_filter_failures,
+            *date_filter_failures,
+            *preserved_failures,
+            *new_failures,
+        ],
         notes=[*title_notes, *reference_notes],
     )
 
